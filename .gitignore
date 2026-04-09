@@ -1,0 +1,58 @@
+# Cloned upstream repo
+repo/
+
+# Heavy runtime artifacts
+logs/
+**/logs/
+*.log
+*.pt
+*.bin
+*.pkl
+*.ckpt
+*.tar.gz
+*.whl
+
+# Data
+data/
+**/data/
+datasets/
+
+# Scripts cache (contains FA3 wheel)
+scripts/cache/
+scripts/*.whl
+
+# Remote/cloud run artifacts
+cloud_run/
+remote_results/
+h100_1gpu_runs/
+hillclimb_1xh100/
+final_8xh100/
+slot_final/
+ttt_tuning/
+gptq_ttt_submission/
+batch_run.log
+local_run.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Experiment artifacts we don't want to commit
+**/checkpoints/
+**/final_model.pt
+**/config.json
+!research/*.json
