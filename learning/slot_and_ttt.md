@@ -31,6 +31,7 @@ Each chunk is scored BEFORE any update that could use those tokens.
 | Post-quant AdamW TTT | ~neutral | Better than SGD but still limited by quantization |
 | **Pre-quant AdamW TTT** | **-0.027** | Run TTT on full-precision EMA, THEN quantize |
 | LoRA TTT | -0.007 | Low-rank adapters, less aggressive |
+| Pre-quant TTT + 8-GPU parallel (per-epoch sync) | **-0.027** (same quality) | 8x speedup via all_reduce AVG, ~80s instead of ~635s |
 
 **Key insight**: TTT works much better on full-precision weights. The quantized
 weight manifold is jagged — gradient updates overshoot and oscillate.
@@ -108,6 +109,85 @@ submissions at 1.005 BPB do.
 | Cost per chunk | Full backward pass through model | Matrix-add + cross-entropy |
 | Parameters modified | Millions (all unfrozen layers) | Thousands (vocab_size) |
 | Convergence | Needs 3-6 epochs | 25 L-BFGS iters |
-| Time budget | ~6-13 min for 3 epochs | ~10 min for all windows |
+| Time budget | ~6-13 min for 3 epochs (single GPU) | ~10 min for all windows |
 | Best when | Model needs to adapt its representations | Output distribution needs shifting |
 | Stackable? | Pre-quant TTT + SLOT are independent | Yes, run SLOT after TTT |
+
+## Parallelizing TTT Across GPUs
+
+### The Problem
+Pre-quant TTT runs 3 epochs over 1238 validation chunks. On a single GPU (rank 0),
+this takes ~635 seconds — over the 10-min eval budget. The other 7 GPUs sit idle.
+
+### How TTT Works (step by step)
+Walk through what happens at each step:
+
+1. **Load a chunk** of validation tokens (32K tokens)
+2. **Forward pass** through the model → compute loss (cross-entropy)
+3. **Backward pass** → compute gradients
+4. **AdamW optimizer step** → update weights
+5. **Repeat** for all chunks = 1 epoch
+6. After N epochs, the model is "adapted" to the validation distribution
+
+The key insight: each chunk's update is a small gradient step. The order matters
+somewhat (later chunks benefit from earlier adaptation) but it's not critical —
+the updates are small enough that averaging works.
+
+### Three Parallelization Strategies
+
+**Option A: Fewer epochs (simple)**
+- Just run 1 epoch instead of 3
+- ~212s, fits in budget
+- Captures ~70% of the gain (diminishing returns per epoch)
+- Tradeoff: leave ~0.007 BPB on the table
+
+**Option B: Data-parallel, single sync**
+```python
+# Each rank processes 1/8 of chunks independently
+my_chunks = range(rank, num_chunks, world_size)
+for epoch in range(3):
+    for ci in my_chunks:
+        loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+
+# Average weights at the very end
+for p in model.parameters():
+    dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
+```
+- 8x speedup (~80s for 3 epochs)
+- Problem: ranks diverge over 3 epochs since they train independently
+- The final average may not be as good as sequential training
+
+**Option C: Data-parallel with per-epoch sync (recommended)**
+```python
+for epoch in range(3):
+    # Each rank trains on its 1/8 of chunks
+    my_chunks = range(rank, num_chunks, world_size)
+    for ci in my_chunks:
+        loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+    
+    # Sync after each epoch — all ranks get averaged weights
+    for p in model.parameters():
+        if p.requires_grad:
+            dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
+```
+- Same 8x speedup (~80s)
+- Each epoch starts from averaged weights → less divergence
+- Epoch 2 benefits from ALL data seen in epoch 1 (not just this rank's subset)
+- This is essentially "federated averaging" with 8 workers and 3 rounds
+
+### Why all_reduce AVG works for TTT
+- TTT does small gradient updates (lr=3e-4, weight_decay=0.01)
+- Each chunk shifts the model by a tiny amount
+- Averaging 8 independently-shifted models is close to training on all data sequentially
+- The per-epoch sync prevents divergence from accumulating
+- This is the same principle behind distributed SGD / federated learning
+
+### Practical Notes
+- The cosine LR schedule should use the **global** chunk index, not the local one
+- Frozen parameters (first 2 blocks + embeddings) don't need all_reduce since they weren't updated
+- The all_reduce adds ~1-2s overhead per epoch (negligible vs the training time saved)
+- No need for gradient all_reduce during training — each rank has its own optimizer state
